@@ -25,7 +25,6 @@ import org.apache.hadoop.fs.Path;
 import gobblin.annotation.Alpha;
 import gobblin.hive.spec.HiveSpec;
 
-
 /**
  * An interface for generating a {@link HiveSpec} for a {@link Path}.
  *
