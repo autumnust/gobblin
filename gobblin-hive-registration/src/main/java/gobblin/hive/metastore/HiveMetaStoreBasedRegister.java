@@ -19,8 +19,10 @@ package gobblin.hive.metastore;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
 
 import org.apache.commons.pool2.impl.GenericObjectPoolConfig;
@@ -97,6 +99,8 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
   private final HiveLock locks = new HiveLock();
   private final EventSubmitter eventSubmitter;
   private final MetricContext metricContext;
+  private final ConcurrentHashMap<String, String> dbsExist = new ConcurrentHashMap<>();
+  private final ConcurrentHashMap<String, String> tbsExist = new ConcurrentHashMap<>();
 
   public HiveMetaStoreBasedRegister(State state, Optional<String> metastoreURI) throws IOException {
     super(state);
@@ -140,21 +144,14 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
   }
 
   private boolean createDbIfNotExists(IMetaStoreClient client, String dbName) throws IOException {
-    Database db = new Database();
-    db.setName(dbName);
-
+    // If database exists, not necessary to proceed.
+    if (this.dbsExist.containsKey(dbName)) {
+      return false;
+    }
+    // Proceed if Database is not existed.
     try (AutoCloseableLock lock = this.locks.getDbLock(dbName)) {
-      try {
-        try (Timer.Context context = this.metricContext.timer(GET_HIVE_DATABASE).time()) {
-          client.getDatabase(db.getName());
-        }
-        return false;
-      } catch (NoSuchObjectException nsoe) {
-        // proceed with create
-      } catch (TException te) {
-        throw new IOException(te);
-      }
-
+      Database db = new Database();
+      db.setName(dbName);
       Preconditions.checkState(this.hiveDbRootDir.isPresent(),
           "Missing required property " + HiveRegProps.HIVE_DB_ROOT_DIR);
       db.setLocationUri(new Path(this.hiveDbRootDir.get(), dbName + HIVE_DB_EXTENSION).toString());
@@ -165,6 +162,7 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
         }
         log.info("Created database " + dbName);
         HiveMetaStoreEventHelper.submitSuccessfulDBCreation(this.eventSubmitter, dbName);
+        dbsExist.put(dbName, "");
         return true;
       } catch (AlreadyExistsException e) {
         return false;
@@ -237,12 +235,21 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
     String dbName = table.getDbName();
     String tableName = table.getTableName();
     try (AutoCloseableLock lock = this.locks.getTableLock(dbName, tableName)) {
-      try {
-        try (Timer.Context context = this.metricContext.timer(CREATE_HIVE_TABLE).time()) {
-          client.createTable(getTableWithCreateTimeNow(table));
+      // If table already existed we can save one RPC.
+      if (!this.tbsExist.containsKey(dbName + ":" + tableName)) {
+        try {
+          try (Timer.Context context = this.metricContext.timer(CREATE_HIVE_TABLE).time()) {
+            client.createTable(getTableWithCreateTimeNow(table));
+            this.tbsExist.put(dbName + ":" + tableName, "");
+          }
+          log.info(String.format("Created Hive table %s in db %s", tableName, dbName));
+        }catch (TException e) {
+          log.error(
+              String.format("Unable to create Hive table %s in db %s: " + e.getMessage(), tableName, dbName), e);
+          throw e;
         }
-        log.info(String.format("Created Hive table %s in db %s", tableName, dbName));
-      } catch (AlreadyExistsException e) {
+      }
+      else {
         log.info("Table {} already exists in db {}.", tableName, dbName);
         try {
           HiveTable existingTable;
@@ -261,16 +268,15 @@ public class HiveMetaStoreBasedRegister extends HiveRegister {
               e2);
           throw e2;
         }
-      } catch (TException e) {
-        log.error(
-            String.format("Unable to create Hive table %s in db %s: " + e.getMessage(), tableName, dbName), e);
-        throw e;
       }
     }
   }
 
   @Override
   public boolean existsTable(String dbName, String tableName) throws IOException {
+    if ( this.tbsExist.containsKey(dbName + ":" + tableName )) {
+      return true;
+    }
     try (AutoReturnableObject<IMetaStoreClient> client = this.clientPool.getClient()) {
       try (Timer.Context context = this.metricContext.timer(TABLE_EXISTS).time()) {
         return client.get().tableExists(dbName, tableName);
